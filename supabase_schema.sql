@@ -1,5 +1,7 @@
--- Run this SQL in your Supabase project's SQL Editor.
--- Keep the service-role key only in the hosting provider's server-side secrets.
+-- Face Detection Phase I visitor analytics schema.
+-- Run this script in the Supabase SQL Editor.
+-- Keep the Supabase secret/service-role key only in server-side hosting secrets.
+
 create table if not exists public.visitors (
   session_id text primary key,
   first_seen timestamptz not null default now(),
@@ -9,6 +11,7 @@ create table if not exists public.visitors (
   browser text,
   device text,
   consent_to_analytics boolean not null default true,
+  ip_address text,
   name text,
   email text
 );
@@ -20,7 +23,17 @@ create table if not exists public.page_views (
   viewed_at timestamptz not null default now()
 );
 
--- The app accesses these tables from the server with the service-role key.
--- Do not expose that key in browser code or commit it to GitHub.
+-- Ensure older projects gain the IP column safely.
+alter table public.visitors
+  add column if not exists ip_address text;
+
 alter table public.visitors enable row level security;
 alter table public.page_views enable row level security;
+
+-- The Streamlit server uses the secret/service-role key. Never expose it
+-- in browser code, a public repository, screenshots, or client-side apps.
+grant all on table public.visitors to service_role;
+grant all on table public.page_views to service_role;
+grant usage, select on sequence public.page_views_id_seq to service_role;
+
+notify pgrst, 'reload schema';
