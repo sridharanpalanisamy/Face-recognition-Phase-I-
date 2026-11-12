@@ -92,21 +92,30 @@ def get_client_ip():
     except (AttributeError, ValueError, TypeError):
         return None
 
-def save_visit(session_id, page, user_agent, browser, device, ip_address=None):
-    cfg = supabase_settings()
-    url = cfg.get("url", "").rstrip("/")
-    key = cfg.get("service_role_key", "")
+def save_visit(session_id, page, user_agent, browser, device,
+               ip_address=None, first_seen=None, clear_ip=False):
+    """Insert a session once, then update activity without changing its start time."""
+    now = utc_now()
+    started = first_seen or now
     record = {
         "session_id": session_id,
-        "first_seen": utc_now(),
-        "last_seen": utc_now(),
+        "first_seen": started,
+        "last_seen": now,
         "page": page,
-        "user_agent": user_agent[:500],
+        "user_agent": (user_agent or "")[:500],
         "browser": browser,
         "device": device,
         "consent_to_analytics": True,
-        "ip_address": ip_address,
     }
+    # Preserve a captured IP if the hosting platform temporarily omits it.
+    if ip_address:
+        record["ip_address"] = ip_address
+    elif clear_ip:
+        record["ip_address"] = None
+
+    cfg = supabase_settings()
+    url = cfg.get("url", "").rstrip("/")
+    key = cfg.get("service_role_key", "")
     if url and key:
         import requests
         endpoint = url + "/rest/v1/visitors?on_conflict=session_id"
@@ -123,6 +132,7 @@ def save_visit(session_id, page, user_agent, browser, device, ip_address=None):
         )
         response.raise_for_status()
         return "Supabase"
+
     with get_db() as conn:
         conn.execute("""
             INSERT INTO visitors
@@ -135,9 +145,13 @@ def save_visit(session_id, page, user_agent, browser, device, ip_address=None):
                 user_agent=excluded.user_agent,
                 browser=excluded.browser,
                 device=excluded.device,
-                ip_address=excluded.ip_address
-        """, (session_id, record["first_seen"], record["last_seen"], page,
-              record["user_agent"], browser, device, ip_address))
+                ip_address=CASE
+                    WHEN ? = 1 THEN NULL
+                    WHEN ? IS NOT NULL THEN ?
+                    ELSE visitors.ip_address
+                END
+        """, (session_id, started, now, page, record["user_agent"], browser, device,
+              ip_address, 1 if clear_ip else 0, ip_address, ip_address))
         conn.commit()
     return "Local SQLite (temporary on most cloud hosts)"
 
@@ -229,8 +243,14 @@ ip_collection_opt_out = st.sidebar.checkbox(
     key="ip_collection_opt_out",
 )
 
+# Refresh every minute to record a heartbeat while the page remains connected.
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=60_000, key="visitor_analytics_heartbeat")
+
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
+if "session_started_at" not in st.session_state:
+    st.session_state.session_started_at = utc_now()
 if "analytics_page" not in st.session_state:
     st.session_state.analytics_page = None
 if "analytics_ip_opt_out" not in st.session_state:
@@ -244,19 +264,25 @@ except Exception:
 
 browser, device = parse_browser(user_agent)
 page_changed = st.session_state.analytics_page != page
-opt_out_changed = st.session_state.analytics_ip_opt_out != ip_collection_opt_out
-if page_changed or opt_out_changed:
-    try:
-        client_ip = None if ip_collection_opt_out else get_client_ip()
-        st.session_state.analytics_storage = save_visit(
-            st.session_state.session_id, page, user_agent, browser, device, client_ip
-        )
-        if page_changed:
-            save_page_view(st.session_state.session_id, page)
-        st.session_state.analytics_page = page
-        st.session_state.analytics_ip_opt_out = ip_collection_opt_out
-    except Exception as exc:
-        st.session_state.analytics_error = str(exc)
+try:
+    client_ip = None if ip_collection_opt_out else get_client_ip()
+    st.session_state.analytics_storage = save_visit(
+        st.session_state.session_id,
+        page,
+        user_agent,
+        browser,
+        device,
+        ip_address=client_ip,
+        first_seen=st.session_state.session_started_at,
+        clear_ip=ip_collection_opt_out,
+    )
+    if page_changed:
+        save_page_view(st.session_state.session_id, page)
+    st.session_state.analytics_page = page
+    st.session_state.analytics_ip_opt_out = ip_collection_opt_out
+    st.session_state.analytics_error = None
+except Exception as exc:
+    st.session_state.analytics_error = str(exc)
 
 if page == "Home":
     st.markdown('<div class="hero"><h1>Real-Time Face Detection</h1><p>Phase I showcase • Detect faces in a live camera stream using OpenCV.</p></div>', unsafe_allow_html=True)
@@ -353,15 +379,40 @@ elif page == "Admin analytics":
                 d.metric("Sessions with IP", ip_count)
                 if total:
                     st.subheader("Recent visitor sessions")
-                    visible = [c for c in ["first_seen", "last_seen", "page", "browser", "device", "ip_address", "name", "email"] if c in visitors.columns]
-                    st.dataframe(visitors[visible], use_container_width=True, hide_index=True)
+                    display_visitors = visitors.copy()
+                    # Store timestamps in UTC; display them in India Standard Time.
+                    for timestamp_col in ["first_seen", "last_seen"]:
+                        if timestamp_col in display_visitors.columns:
+                            parsed = pd.to_datetime(display_visitors[timestamp_col], utc=True, errors="coerce")
+                            display_visitors[timestamp_col] = parsed.dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d %H:%M:%S IST")
+                    if {"first_seen", "last_seen"}.issubset(visitors.columns):
+                        started = pd.to_datetime(visitors["first_seen"], utc=True, errors="coerce")
+                        ended = pd.to_datetime(visitors["last_seen"], utc=True, errors="coerce")
+                        seconds = (ended - started).dt.total_seconds().clip(lower=0)
+                        def duration_label(value):
+                            if pd.isna(value):
+                                return "Unavailable"
+                            value = int(value)
+                            hours, remainder = divmod(value, 3600)
+                            minutes, secs = divmod(remainder, 60)
+                            if hours:
+                                return f"{hours}h {minutes}m"
+                            if minutes:
+                                return f"{minutes}m {secs}s"
+                            return f"{secs}s"
+                        display_visitors["observed_session_span"] = seconds.map(duration_label)
+                    visible = [c for c in ["first_seen", "last_seen", "observed_session_span", "page", "browser", "device", "ip_address", "name", "email"] if c in display_visitors.columns]
+                    st.dataframe(display_visitors[visible], use_container_width=True, hide_index=True)
+                    st.caption("Observed session span is the elapsed time between first_seen and last_seen, not proof of continuous attention. last_seen refreshes about once per minute while the page remains connected.")
                     if "browser" in visitors:
                         st.subheader("Browser breakdown")
                         st.bar_chart(visitors["browser"].fillna("Unavailable").value_counts())
                 if len(views):
                     st.subheader("Recent page views")
-                    st.dataframe(views[["viewed_at", "page", "session_id"]].head(100),
-                                 use_container_width=True, hide_index=True)
+                    display_views = views[["viewed_at", "page", "session_id"]].head(100).copy()
+                    parsed_views = pd.to_datetime(display_views["viewed_at"], utc=True, errors="coerce")
+                    display_views["viewed_at"] = parsed_views.dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d %H:%M:%S IST")
+                    st.dataframe(display_views, use_container_width=True, hide_index=True)
                 st.caption("Visitor sessions are not verified real-world identities. IP addresses are recorded automatically when available unless the visitor opts out. Precise location is not collected.")
             except Exception as exc:
                 st.error(f"Analytics could not be loaded: {exc}")
