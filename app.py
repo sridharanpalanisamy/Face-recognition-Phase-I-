@@ -94,7 +94,7 @@ def get_client_ip():
 
 def save_visit(session_id, page, user_agent, browser, device,
                ip_address=None, first_seen=None, clear_ip=False):
-    """Insert a session once, then update activity without changing its start time."""
+    """Create a session once, then update activity without replacing its start time."""
     now = utc_now()
     started = first_seen or now
     record = {
@@ -107,7 +107,6 @@ def save_visit(session_id, page, user_agent, browser, device,
         "device": device,
         "consent_to_analytics": True,
     }
-    # Preserve a captured IP if the hosting platform temporarily omits it.
     if ip_address:
         record["ip_address"] = ip_address
     elif clear_ip:
@@ -118,19 +117,38 @@ def save_visit(session_id, page, user_agent, browser, device,
     key = cfg.get("service_role_key", "")
     if url and key:
         import requests
-        endpoint = url + "/rest/v1/visitors?on_conflict=session_id"
-        response = requests.post(
-            endpoint,
-            headers={
-                "apikey": key,
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=minimal",
-            },
-            json=record,
-            timeout=10,
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        endpoint = url + "/rest/v1/visitors"
+        # Insert only if this session does not exist. Never overwrite first_seen.
+        insert_headers = {**headers, "Prefer": "resolution=ignore-duplicates,return=minimal"}
+        inserted = requests.post(
+            endpoint + "?on_conflict=session_id",
+            headers=insert_headers, json=record, timeout=10
         )
-        response.raise_for_status()
+        inserted.raise_for_status()
+
+        # Update activity fields separately, leaving first_seen untouched.
+        update_record = {
+            "last_seen": now,
+            "page": page,
+            "user_agent": record["user_agent"],
+            "browser": browser,
+            "device": device,
+        }
+        if ip_address:
+            update_record["ip_address"] = ip_address
+        elif clear_ip:
+            update_record["ip_address"] = None
+        updated = requests.patch(
+            endpoint + "?session_id=eq." + session_id,
+            headers=headers, json=update_record, timeout=10
+        )
+        updated.raise_for_status()
         return "Supabase"
 
     with get_db() as conn:
