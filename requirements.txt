@@ -5,3 +5,4 @@ opencv-python-headless>=4.9
 av>=12
 pandas>=2.0
 requests>=2.31
+streamlit-autorefresh>=1.0.1
