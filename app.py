@@ -217,28 +217,24 @@ st.sidebar.title("Phase I Demo")
 page = st.sidebar.radio("Navigate", ["Home", "Live face detection", "Visitor registration", "Admin analytics"])
 st.sidebar.caption("Face detection only • OpenCV Haar Cascade")
 
-# IP collection is optional and disabled unless the visitor actively opts in.
+# IP analytics are automatic by default, with a visible opt-out control.
 st.sidebar.info(
-    "Basic session analytics use a random session ID and browser/device category. "
-    "IP-address collection is optional and disabled by default. Camera images are never stored by analytics."
+    "Privacy notice: this site automatically records your connection IP for visitor analytics "
+    "when the hosting platform makes it available. It is visible only in the private admin dashboard. "
+    "You can opt out for this session below. Camera images are never stored by analytics."
 )
-ip_collection_consent = st.sidebar.checkbox(
-    "I agree to optional IP-address collection for this session",
+ip_collection_opt_out = st.sidebar.checkbox(
+    "Opt out of IP-address analytics for this session",
     value=False,
-    key="ip_collection_consent",
+    key="ip_collection_opt_out",
 )
-if ip_collection_consent:
-    st.sidebar.caption(
-        "Your connection IP may be stored with this session and shown only in the private admin dashboard. "
-        "You can withdraw consent by unchecking this box."
-    )
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "analytics_page" not in st.session_state:
     st.session_state.analytics_page = None
-if "analytics_ip_consent" not in st.session_state:
-    st.session_state.analytics_ip_consent = None
+if "analytics_ip_opt_out" not in st.session_state:
+    st.session_state.analytics_ip_opt_out = None
 
 try:
     from streamlit_javascript import st_javascript
@@ -248,17 +244,17 @@ except Exception:
 
 browser, device = parse_browser(user_agent)
 page_changed = st.session_state.analytics_page != page
-consent_changed = st.session_state.analytics_ip_consent != ip_collection_consent
-if page_changed or consent_changed:
+opt_out_changed = st.session_state.analytics_ip_opt_out != ip_collection_opt_out
+if page_changed or opt_out_changed:
     try:
-        client_ip = get_client_ip() if ip_collection_consent else None
+        client_ip = None if ip_collection_opt_out else get_client_ip()
         st.session_state.analytics_storage = save_visit(
             st.session_state.session_id, page, user_agent, browser, device, client_ip
         )
         if page_changed:
             save_page_view(st.session_state.session_id, page)
         st.session_state.analytics_page = page
-        st.session_state.analytics_ip_consent = ip_collection_consent
+        st.session_state.analytics_ip_opt_out = ip_collection_opt_out
     except Exception as exc:
         st.session_state.analytics_error = str(exc)
 
@@ -349,10 +345,12 @@ elif page == "Admin analytics":
                 st.caption(f"Data source: {storage}")
                 total = len(visitors)
                 registered = int(visitors["email"].notna().sum()) if total and "email" in visitors else 0
-                a, b, c = st.columns(3)
+                ip_count = int(visitors["ip_address"].notna().sum()) if total and "ip_address" in visitors else 0
+                a, b, c, d = st.columns(4)
                 a.metric("Tracked sessions", total)
                 b.metric("Registered contacts", registered)
                 c.metric("Page views", len(views))
+                d.metric("Sessions with IP", ip_count)
                 if total:
                     st.subheader("Recent visitor sessions")
                     visible = [c for c in ["first_seen", "last_seen", "page", "browser", "device", "ip_address", "name", "email"] if c in visitors.columns]
@@ -364,11 +362,11 @@ elif page == "Admin analytics":
                     st.subheader("Recent page views")
                     st.dataframe(views[["viewed_at", "page", "session_id"]].head(100),
                                  use_container_width=True, hide_index=True)
-                st.caption("Visitor sessions are not verified real-world identities. IP addresses appear only for sessions where the visitor opted in. Precise location is not collected.")
+                st.caption("Visitor sessions are not verified real-world identities. IP addresses are recorded automatically when available unless the visitor opts out. Precise location is not collected.")
             except Exception as exc:
                 st.error(f"Analytics could not be loaded: {exc}")
         elif entered:
             st.error("Incorrect password.")
 
 st.divider()
-st.caption("Privacy: basic analytics use a random session ID and browser/device category. IP-address collection is optional and off by default; an IP is stored only when the visitor checks the IP-consent box, and consent can be withdrawn by unchecking it. No precise location, camera frame, or face image is collected or stored by analytics. Contact details are saved only after the visitor submits the optional form and checks the contact-permission box.")
+st.caption("Privacy: this site automatically records a visitor's connection IP for analytics when the hosting platform makes it available. Visitors are notified in the sidebar and can opt out for the session; opting out clears the IP stored for that session. IP addresses are shown only in the private admin dashboard. No precise location, camera frame, or face image is collected or stored by analytics. Contact details are saved only after the visitor submits the optional form and checks the contact-permission box.")
