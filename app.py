@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import re
 import sqlite3
@@ -32,10 +33,16 @@ def get_db():
             browser TEXT,
             device TEXT,
             consent_to_analytics INTEGER NOT NULL DEFAULT 1,
+            ip_address TEXT,
             name TEXT,
             email TEXT
         )
     """)
+    existing_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(visitors)").fetchall()
+    }
+    if "ip_address" not in existing_columns:
+        connection.execute("ALTER TABLE visitors ADD COLUMN ip_address TEXT")
     connection.execute("""
         CREATE TABLE IF NOT EXISTS page_views (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +82,17 @@ def supabase_settings():
     except Exception:
         return {}
 
-def save_visit(session_id, page, user_agent, browser, device):
+def get_client_ip():
+    """Return the connection IP exposed by Streamlit, if available."""
+    try:
+        value = st.context.ip_address
+        if not value:
+            return None
+        return str(ipaddress.ip_address(str(value)))
+    except (AttributeError, ValueError, TypeError):
+        return None
+
+def save_visit(session_id, page, user_agent, browser, device, ip_address=None):
     cfg = supabase_settings()
     url = cfg.get("url", "").rstrip("/")
     key = cfg.get("service_role_key", "")
@@ -88,6 +105,7 @@ def save_visit(session_id, page, user_agent, browser, device):
         "browser": browser,
         "device": device,
         "consent_to_analytics": True,
+        "ip_address": ip_address,
     }
     if url and key:
         import requests
@@ -108,16 +126,18 @@ def save_visit(session_id, page, user_agent, browser, device):
     with get_db() as conn:
         conn.execute("""
             INSERT INTO visitors
-                (session_id, first_seen, last_seen, page, user_agent, browser, device, consent_to_analytics)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                (session_id, first_seen, last_seen, page, user_agent, browser, device,
+                 consent_to_analytics, ip_address)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 last_seen=excluded.last_seen,
                 page=excluded.page,
                 user_agent=excluded.user_agent,
                 browser=excluded.browser,
-                device=excluded.device
+                device=excluded.device,
+                ip_address=excluded.ip_address
         """, (session_id, record["first_seen"], record["last_seen"], page,
-              record["user_agent"], browser, device))
+              record["user_agent"], browser, device, ip_address))
         conn.commit()
     return "Local SQLite (temporary on most cloud hosts)"
 
@@ -197,14 +217,28 @@ st.sidebar.title("Phase I Demo")
 page = st.sidebar.radio("Navigate", ["Home", "Live face detection", "Visitor registration", "Admin analytics"])
 st.sidebar.caption("Face detection only • OpenCV Haar Cascade")
 
-# Anonymous analytics notice: this tracks a random session ID and basic browser/device class.
-# It does not record camera frames, face images, names, email addresses, or IP addresses.
-st.sidebar.info("Anonymous usage analytics are active when this notice is displayed. No camera image is recorded by analytics.")
+# IP collection is optional and disabled unless the visitor actively opts in.
+st.sidebar.info(
+    "Basic session analytics use a random session ID and browser/device category. "
+    "IP-address collection is optional and disabled by default. Camera images are never stored by analytics."
+)
+ip_collection_consent = st.sidebar.checkbox(
+    "I agree to optional IP-address collection for this session",
+    value=False,
+    key="ip_collection_consent",
+)
+if ip_collection_consent:
+    st.sidebar.caption(
+        "Your connection IP may be stored with this session and shown only in the private admin dashboard. "
+        "You can withdraw consent by unchecking this box."
+    )
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "analytics_page" not in st.session_state:
     st.session_state.analytics_page = None
+if "analytics_ip_consent" not in st.session_state:
+    st.session_state.analytics_ip_consent = None
 
 try:
     from streamlit_javascript import st_javascript
@@ -213,13 +247,18 @@ except Exception:
     user_agent = ""
 
 browser, device = parse_browser(user_agent)
-if st.session_state.analytics_page != page:
+page_changed = st.session_state.analytics_page != page
+consent_changed = st.session_state.analytics_ip_consent != ip_collection_consent
+if page_changed or consent_changed:
     try:
+        client_ip = get_client_ip() if ip_collection_consent else None
         st.session_state.analytics_storage = save_visit(
-            st.session_state.session_id, page, user_agent, browser, device
+            st.session_state.session_id, page, user_agent, browser, device, client_ip
         )
-        save_page_view(st.session_state.session_id, page)
+        if page_changed:
+            save_page_view(st.session_state.session_id, page)
         st.session_state.analytics_page = page
+        st.session_state.analytics_ip_consent = ip_collection_consent
     except Exception as exc:
         st.session_state.analytics_error = str(exc)
 
@@ -316,7 +355,7 @@ elif page == "Admin analytics":
                 c.metric("Page views", len(views))
                 if total:
                     st.subheader("Recent visitor sessions")
-                    visible = [c for c in ["first_seen", "last_seen", "page", "browser", "device", "name", "email"] if c in visitors.columns]
+                    visible = [c for c in ["first_seen", "last_seen", "page", "browser", "device", "ip_address", "name", "email"] if c in visitors.columns]
                     st.dataframe(visitors[visible], use_container_width=True, hide_index=True)
                     if "browser" in visitors:
                         st.subheader("Browser breakdown")
@@ -325,11 +364,11 @@ elif page == "Admin analytics":
                     st.subheader("Recent page views")
                     st.dataframe(views[["viewed_at", "page", "session_id"]].head(100),
                                  use_container_width=True, hide_index=True)
-                st.caption("Visitor sessions are not verified real-world identities. IP addresses and precise location are not collected by this app.")
+                st.caption("Visitor sessions are not verified real-world identities. IP addresses appear only for sessions where the visitor opted in. Precise location is not collected.")
             except Exception as exc:
                 st.error(f"Analytics could not be loaded: {exc}")
         elif entered:
             st.error("Incorrect password.")
 
 st.divider()
-st.caption("Privacy: anonymous session analytics use a random session ID and basic browser/device information. No IP address, precise location, camera frame, or face image is collected or stored by analytics. Contact details are saved only after the visitor submits the optional form and checks the permission box.")
+st.caption("Privacy: basic analytics use a random session ID and browser/device category. IP-address collection is optional and off by default; an IP is stored only when the visitor checks the IP-consent box, and consent can be withdrawn by unchecking it. No precise location, camera frame, or face image is collected or stored by analytics. Contact details are saved only after the visitor submits the optional form and checks the contact-permission box.")
